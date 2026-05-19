@@ -1,0 +1,279 @@
+# Using RemoteCall (darksword) to Refresh SideStore Apps
+
+## Background
+
+**RemoteCall** (from darksword-kexploit-fun) is a technique that lets you execute arbitrary function calls inside another process's address space via task port manipulation and PAC bypass. It works by:
+
+1. `init_remote_call("ProcessName", false)` — attaches to a target process
+2. `do_remote_call_stable(timeout, "symbol_name", x0..x7)` — calls any C/ObjC function in that process
+3. Helper functions like `remote_alloc_str`, `remote_sel`, `remote_getClass`, `remote_msg` — bridge ObjC messaging
+4. `destroy_remote_call()` — cleans up
+
+**SideStore** refreshes apps through its `AppManager` class:
+- `AppManager.shared.refresh([InstalledApp])` — foreground refresh
+- `AppManager.shared.backgroundRefresh([InstalledApp])` — background refresh via `BackgroundRefreshAppsOperation`
+- Also exposed as an App Intent: `RefreshAllAppsIntent`
+
+---
+
+## Two Approaches
+
+### Approach 1: RemoteCall Directly into SideStore Process (Recommended)
+
+Target SideStore's process and invoke its internal ObjC methods via `objc_msgSend`. This is the most direct approach.
+
+**Flow:**
+```
+darksword app
+  └── init_remote_call("SideStore", false)  // or whatever SideStore's process name is
+       └── remote ObjC calls inside SideStore's address space:
+            1. Get AppManager.shared
+            2. Get installed apps from database
+            3. Call refresh method
+       └── destroy_remote_call()
+```
+
+**Code (Objective-C, darksword-style):**
+
+```objc
+void refresh_sidestore_apps(void) {
+    // SideStore's process name — check with `ps` on device
+    // Could be "SideStore", "AltStore", or the bundle executable name
+    init_remote_call("SideStore", false);
+    printf("[REFRESH] RemoteCall initialized on SideStore\n");
+
+    // Register all the selectors we need
+    uint64_t selShared        = remote_sel("shared");
+    uint64_t selRefresh       = remote_sel("refresh:presentingViewController:");
+    uint64_t selViewContext   = remote_sel("viewContext");
+    uint64_t selFetch         = remote_sel("executeFetchRequest:error:");
+    
+    // Alternative simpler approach: use the App Intent system
+    // or trigger the background refresh operation directly
+    
+    // Get AppManager class and shared instance
+    uint64_t appManagerClass = remote_getClass("AppManager");
+    if (!appManagerClass) {
+        printf("[REFRESH] AppManager class not found\n");
+        destroy_remote_call();
+        return;
+    }
+    
+    uint64_t appManager = remote_msg(appManagerClass, selShared, 0, 0, 0, 0);
+    printf("[REFRESH] AppManager.shared = 0x%llx\n", appManager);
+    
+    // This gets complex because we need to fetch InstalledApp objects
+    // from CoreData inside SideStore's process...
+    // A simpler method exists below.
+    
+    destroy_remote_call();
+}
+```
+
+> [!WARNING]
+> Directly calling SideStore's Swift/ObjC refresh methods via RemoteCall is **complex** because:
+> - `refresh()` requires `[InstalledApp]` objects fetched from CoreData
+> - The method involves async Swift closures and operation queues
+> - SideStore must already be running (process alive) for RemoteCall to attach
+
+### Approach 2: Open SideStore via URL Scheme through SpringBoard (Simpler)
+
+Use RemoteCall on **SpringBoard** (which is always running) to call `LSApplicationWorkspace` to open SideStore, effectively waking it and triggering its foreground logic. SideStore calls `AppManager.shared.update()` in `sceneWillEnterForeground`.
+
+But SideStore doesn't have a dedicated `sidestore://refresh` URL scheme handler. So to make this work cleanly, we'd **add one to SideStore**.
+
+**SideStore already handles these URL schemes:**
+- `sidestore://install?url=...`
+- `sidestore://source?url=...`
+- `sidestore://pairing?urlName=...`
+- `sidestore://certificate?callback_template=...`
+- `sidestore://appbackupresponse/success` or `/failure`
+
+---
+
+## Proposed Implementation
+
+### Step 1: Add a `refresh` URL scheme handler to SideStore
+
+#### [MODIFY] [AppDelegate.swift](file:///Users/system/Documents/test/SideStore-develop/AltStore/AppDelegate.swift)
+
+Add a `"refresh"` case in the `open(_ url:)` method:
+
+```diff
+ case "certificate":
+     ...
+     return true
+     
++case "refresh":
++    DispatchQueue.main.async {
++        self.triggerRefreshAllApps()
++    }
++    return true
++
+ default: return false
+```
+
+Add the helper method:
+
+```swift
+private func triggerRefreshAllApps() {
+    guard DatabaseManager.shared.isStarted else { return }
+    
+    DatabaseManager.shared.persistentContainer.performBackgroundTask { context in
+        let installedApps = InstalledApp.fetchAppsForRefreshingAll(in: context)
+        AppManager.shared.backgroundRefresh(installedApps) { result in
+            switch result {
+            case .success(let results):
+                print("[RemoteRefresh] Refresh completed: \(results.count) apps")
+            case .failure(let error):
+                print("[RemoteRefresh] Refresh failed: \(error)")
+            }
+        }
+    }
+}
+```
+
+#### [MODIFY] [SceneDelegate.swift](file:///Users/system/Documents/test/SideStore-develop/AltStore/SceneDelegate.swift)
+
+Add the same `"refresh"` case in the SceneDelegate's URL handler:
+
+```diff
+ case "certificate":
+     ...
++
++case "refresh":
++    DispatchQueue.main.async {
++        guard DatabaseManager.shared.isStarted else { return }
++        DatabaseManager.shared.persistentContainer.performBackgroundTask { context in
++            let installedApps = InstalledApp.fetchAppsForRefreshingAll(in: context)
++            AppManager.shared.backgroundRefresh(installedApps) { _ in }
++        }
++    }
++
+ default: break
+```
+
+### Step 2: Add RemoteCall trigger in darksword
+
+#### [MODIFY] [ViewController.m](file:///Users/system/Documents/test/darksword-kexploit-fun-main/darksword-kexploit-fun/ViewController.m)
+
+Add a function that uses RemoteCall on SpringBoard to open the `sidestore://refresh` URL:
+
+```objc
+void refresh_sidestore_via_url(void) {
+    init_remote_call("SpringBoard", false);
+    printf("[REFRESH] RemoteCall initialized on SpringBoard\n");
+    usleep(100000);
+
+    // Build the URL string in SpringBoard's memory
+    uint64_t selShared    = remote_sel("sharedApplication");
+    uint64_t selOpenURL   = remote_sel("openURL:options:completionHandler:");
+    uint64_t selURLWithStr = remote_sel("URLWithString:");
+
+    // Create NSString with the sidestore://refresh URL
+    uint64_t urlStrClass = remote_getClass("NSString");
+    uint64_t urlStr = remote_alloc_str("sidestore://refresh");
+    
+    // Create NSURL from string
+    uint64_t nsurlClass = remote_getClass("NSURL");
+    uint64_t selURLStr = remote_sel("URLWithString:");
+    
+    // Allocate the string as an NSString in remote process
+    uint64_t nsStringClass = remote_getClass("NSString");
+    uint64_t selStringWithUTF8 = remote_sel("stringWithUTF8String:");
+    uint64_t nsString = remote_msg(nsStringClass, selStringWithUTF8, urlStr, 0, 0, 0);
+    do_remote_call_stable(5, "free", urlStr, 0,0,0,0,0,0,0);
+    
+    // NSURL *url = [NSURL URLWithString:@"sidestore://refresh"]
+    uint64_t nsurl = remote_msg(nsurlClass, selURLStr, nsString, 0, 0, 0);
+    printf("[REFRESH] NSURL = 0x%llx\n", nsurl);
+    usleep(50000);
+
+    // Create empty NSDictionary for options
+    uint64_t dictClass = remote_getClass("NSDictionary");
+    uint64_t selDict = remote_sel("dictionary");
+    uint64_t emptyDict = remote_msg(dictClass, selDict, 0, 0, 0, 0);
+
+    // [UIApplication sharedApplication]
+    uint64_t uiAppClass = remote_getClass("UIApplication");
+    uint64_t app = remote_msg(uiAppClass, selShared, 0, 0, 0, 0);
+    printf("[REFRESH] UIApplication = 0x%llx\n", app);
+    usleep(50000);
+
+    // [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil]
+    remote_msg(app, selOpenURL, nsurl, emptyDict, 0, 0);
+    printf("[REFRESH] openURL called!\n");
+
+    usleep(500000); // give it time
+    destroy_remote_call();
+    printf("[REFRESH] Done!\n");
+}
+```
+
+**Alternative (using LSApplicationWorkspace directly, no URL scheme needed):**
+
+```objc
+void refresh_sidestore_launch(void) {
+    init_remote_call("SpringBoard", false);
+    
+    uint64_t selDefault = remote_sel("defaultWorkspace");
+    uint64_t selOpen    = remote_sel("openApplicationWithBundleIdentifier:");
+    
+    uint64_t lsClass = remote_getClass("LSApplicationWorkspace");
+    uint64_t workspace = remote_msg(lsClass, selDefault, 0, 0, 0, 0);
+    
+    // Create NSString for bundle ID
+    uint64_t nsStringClass = remote_getClass("NSString");
+    uint64_t selStrUTF8 = remote_sel("stringWithUTF8String:");
+    uint64_t bundleStr = remote_alloc_str("com.SideStore.SideStore");
+    uint64_t nsBundleID = remote_msg(nsStringClass, selStrUTF8, bundleStr, 0, 0, 0);
+    do_remote_call_stable(5, "free", bundleStr, 0,0,0,0,0,0,0);
+    
+    // [workspace openApplicationWithBundleIdentifier:@"com.SideStore.SideStore"]
+    remote_msg(workspace, selOpen, nsBundleID, 0, 0, 0);
+    
+    printf("[REFRESH] Opened SideStore!\n");
+    destroy_remote_call();
+}
+```
+
+### Step 3: Wire it up (lara-style, if using lara)
+
+If you're working from lara instead of raw darksword, you can use the Swift wrapper:
+
+```swift
+// In lara's RemoteView or a new view
+func refreshSideStore() {
+    guard let proc = mgr.sbProc else { return }
+    
+    // Get LSApplicationWorkspace
+    let lsClass = remote_getClass(proc, "LSApplicationWorkspace")
+    let selDefault = remote_sel(proc, "defaultWorkspace")
+    let workspace = remote_msg(proc, lsClass, selDefault, 0, 0, 0, 0)
+    
+    // Open SideStore's URL
+    let selOpenURL = remote_sel(proc, "openSensitiveURL:withOptions:")
+    let urlStr = remote_NSString(proc, "sidestore://refresh")
+    let emptyDict = remote_msg(proc, remote_getClass(proc, "NSDictionary"), remote_sel(proc, "dictionary"), 0, 0, 0, 0)
+    
+    remote_msg(proc, workspace, selOpenURL, urlStr, emptyDict, 0, 0)
+}
+```
+
+---
+
+## Open Questions
+
+> [!IMPORTANT]
+> 1. **What is SideStore's actual process name on your device?** Run `ps aux | grep -i side` to find it. It could be `SideStore`, `AltStore`, or the executable name from the bundle.
+> 2. **Do you want to modify SideStore's source code** to add the `sidestore://refresh` URL handler? Or do you prefer the approach that just opens/foregrounds SideStore (which triggers `AppManager.shared.update()` but not a full refresh)?
+> 3. **Are you running from lara or darksword directly?** This determines which API style (ObjC C-functions vs Swift RemoteCall class) we use.
+
+## Verification Plan
+
+### Manual Testing
+1. Build and deploy darksword/lara with the new refresh function
+2. Run the exploit to get KRW
+3. Initialize RemoteCall on SpringBoard
+4. Call the refresh function
+5. Verify SideStore opens and begins refreshing apps (check SideStore's logs/UI)

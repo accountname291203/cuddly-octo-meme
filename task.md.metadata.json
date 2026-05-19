@@ -1,0 +1,5 @@
+{
+  "artifactType":  "ARTIFACT_TYPE_TASK",
+  "summary":  "Task checklist for implementing VPN-less SideStore refresh via lara's RemoteCall system. Covers SideStore modifications (RefreshAppOperation fallback, BackgroundRefreshAppsOperation changes) and lara modifications (rc.h/rc.m misagent bypass functions, RemoteView UI, bridging header updates).",
+  "updatedAt":  "2026-05-18T23:58:30.667390Z"
+}

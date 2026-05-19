@@ -1,0 +1,7 @@
+{
+  "artifactType":  "ARTIFACT_TYPE_IMPLEMENTATION_PLAN",
+  "summary":  "Complete analysis of SideStore's refresh pipeline showing where the LocalDevVPN (minimuxer) dependency lives and how to bypass it using RemoteCall.\n\nThe refresh pipeline has 4 stages: Authentication (Apple API), Provisioning (Apple API), Profile Install (misagent via minimuxer), and App Install (instproxy via minimuxer). The VPN is needed because minimuxer connects to lockdownd/misagent/instproxy services which normally require a USB connection - the VPN fakes a loopback USB tunnel.\n\nThree bypass approaches using RemoteCall:\n1. Direct misagent bypass - Use RemoteCall to call MISProfileInstallProvisioningProfile directly in a system daemon, completely skipping minimuxer\n2. Hybrid approach - Let SideStore handle auth+provisioning normally, then use RemoteCall to install profiles via MCMobileMisagent private API from SpringBoard's context\n3. Full nuclear - Combine kernel R/W to patch sandbox + RemoteCall to directly manipulate app installation without any VPN\n\nIncludes detailed code examples for each approach.",
+  "updatedAt":  "2026-05-18T23:57:02.134279Z",
+  "version":  "1",
+  "requestFeedback":  true
+}
